@@ -7,13 +7,13 @@ import asyncio
 import keyboard
 import pyperclip
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Callable, Awaitable
 import json
 import time
+import winreg
+from dataclasses import dataclass, field
+from typing import Any, Callable, Awaitable
 import websockets
 from websockets.exceptions import ConnectionClosed
-
 import sys
 from game_client_server import GameClientServer
 
@@ -23,7 +23,61 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# --- Context & Data Extraction ---
+
+def enable_webui_in_registry(enable: bool = True) -> bool:
+    """Mirrors setup.ts to allow the Warcraft III client to load local webui files."""
+    try:
+        # Target: HKCU\SOFTWARE\Blizzard Entertainment\Warcraft III
+        key = winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER, r"SOFTWARE\Blizzard Entertainment\Warcraft III"
+        )
+        winreg.SetValueEx(
+            key, "Allow Local Files", 0, winreg.REG_DWORD, 1 if enable else 0
+        )
+        winreg.CloseKey(key)
+        logger.info(f"Registry 'Allow Local Files' set to {enable}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to modify registry: {e}")
+        return False
+
+
+def get_warcraft_install_location() -> str:
+    """Mirrors setup.ts to find the installation directory via Registry."""
+    reg_install_key = (
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Warcraft III"
+    )
+    backup_reg_install_key = (
+        r"SOFTWARE\WOW6432Node\Blizzard Entertainment\Warcraft III\Capabilities"
+    )
+
+    # Try primary uninstaller key
+    try:
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_install_key)
+        loc, _ = winreg.QueryValueEx(key, "InstallLocation")
+        winreg.CloseKey(key)
+        if loc:
+            return str(loc)
+    except OSError:
+        pass
+
+    # Try backup capabilities key
+    try:
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, backup_reg_install_key)
+        app_icon, _ = winreg.QueryValueEx(key, "ApplicationIcon")
+        winreg.CloseKey(key)
+        if app_icon:
+            # app_icon is typically: "C:\Program Files (x86)\Warcraft III\_retail_\x86_64\Warcraft III.exe"
+            # We move up 3 directories to get the base install path safely without string slicing
+            base_path = str(app_icon).strip('"')
+            return os.path.dirname(os.path.dirname(os.path.dirname(base_path)))
+    except OSError:
+        pass
+
+    # Fallback if both fail
+    return r"C:\Program Files (x86)\Warcraft III"
+
+
 @dataclass
 class Context:
     SOCKET_PAYLOAD: dict[str, Any] = field(default_factory=dict)
@@ -35,7 +89,6 @@ def get_ordered_lobby_tags(ctx: Context) -> list[str]:
     if not rec_message:
         return []
 
-    # Using dictionary get/getattr to safely handle dicts or objects
     payload = (
         getattr(rec_message, "payload", rec_message.get("payload"))
         if isinstance(rec_message, dict)
@@ -79,7 +132,6 @@ def copy_tags_to_clipboard(ctx: Context, delimiter: str):
     logger.info(f"Copied {len(tags)} tags to clipboard: '{clipboard_string}'")
 
 
-# --- Socket Service ---
 class SocketService:
     def __init__(
         self, server_url: str, establish_message: dict[str, str], context: Context
@@ -152,11 +204,9 @@ class SocketService:
                 await asyncio.sleep(1)
 
 
-# --- Async Background Task Runner ---
 async def start_async_service(
     hotkey: str, delimiter: str, shutdown_event: asyncio.Event
 ):
-    """Runs the socket and hotkey listener until shutdown_event is set."""
     app_context = Context()
 
     try:
@@ -171,7 +221,6 @@ async def start_async_service(
     establish_msg = {"messageType": "appClient"}
     async with SocketService("ws://127.0.0.1:8888", establish_msg, app_context):
         try:
-            # Wait here until the UI thread sets the event
             await shutdown_event.wait()
             logger.info("Shutdown event received. Closing service...")
         except asyncio.CancelledError:
@@ -181,26 +230,27 @@ async def start_async_service(
             logger.info("Hotkeys unhooked.")
 
 
-# --- Tkinter UI ---
 class AppUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("WC3 BattleTag Copier")
-        self.geometry("500x250")
+        self.geometry("550x300") # Slightly increased height for the new checkbox
         self.resizable(False, False)
 
-        # UI State Variables
         self.is_running = False
         self.loop = None
         self.service_thread = None
         self.shutdown_event = None
 
-        # Config Variables
+        # Fetch Registry paths
+        default_install_dir = get_warcraft_install_location()
+        default_webui_dir = os.path.join(default_install_dir, "_retail_", "webui")
+
         self.delimiter_var = tk.StringVar(value=" ")
         self.hotkey_var = tk.StringVar(value="ctrl+shift+c")
-        self.webui_var = tk.StringVar(
-            value=r"C:\Program Files (x86)\Warcraft III\_retail_\webui"
-        )
+        self.webui_var = tk.StringVar(value=default_webui_dir)
+
+        self.startup_var = tk.BooleanVar(value=self.check_startup_status())
 
         self._build_grid()
 
@@ -210,23 +260,22 @@ class AppUI(tk.Tk):
         tk.Label(self, text="Delimiter String:").grid(
             row=0, column=0, sticky="e", **padding
         )
-        tk.Entry(self, textvariable=self.delimiter_var, width=40).grid(
+        tk.Entry(self, textvariable=self.delimiter_var, width=50).grid(
             row=0, column=1, **padding
         )
 
         tk.Label(self, text="Copy Hotkey:").grid(row=1, column=0, sticky="e", **padding)
-        tk.Entry(self, textvariable=self.hotkey_var, width=40).grid(
+        tk.Entry(self, textvariable=self.hotkey_var, width=50).grid(
             row=1, column=1, **padding
         )
 
         tk.Label(self, text="WebUI Directory:").grid(
             row=2, column=0, sticky="e", **padding
         )
-        tk.Entry(self, textvariable=self.webui_var, width=40).grid(
+        tk.Entry(self, textvariable=self.webui_var, width=50).grid(
             row=2, column=1, **padding
         )
 
-        # The Toggle Button
         self.toggle_btn = tk.Button(
             self,
             text="Start Service",
@@ -236,59 +285,128 @@ class AppUI(tk.Tk):
             fg="white",
         )
         self.toggle_btn.grid(row=3, column=0, columnspan=2, pady=20)
+        
+        tk.Checkbutton(
+            self,
+            text="Run on Windows Startup",
+            variable=self.startup_var,
+            command=self.toggle_startup_registry
+        ).grid(row=3, column=0, columnspan=2, pady=(10, 0))
+
+        # Push the Start button down one row
+        self.toggle_btn = tk.Button(self, text="Start Service", command=self.toggle_service, width=20, bg="#4CAF50", fg="white")
+        self.toggle_btn.grid(row=4, column=0, columnspan=2, pady=20)
+
+
+    def check_startup_status(self) -> bool:
+        """Checks if the app is currently set to run on startup."""
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
+            winreg.QueryValueEx(key, "WC3BattleTagCopier")
+            winreg.CloseKey(key)
+            return True
+        except FileNotFoundError:
+            return False
+        except Exception as e:
+            logger.error(f"Error checking startup registry: {e}")
+            return False
+
+    def toggle_startup_registry(self):
+        """Adds or removes the executable from the Windows Startup registry."""
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        app_name = "WC3BattleTagCopier"
+
+        # Determine the path of the executable
+        if getattr(sys, 'frozen', False):
+            # Running as a PyInstaller compiled executable
+            exe_path = sys.executable
+        else:
+            # Running as a raw python script
+            exe_path = os.path.abspath(sys.argv[0])
+
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
+            if self.startup_var.get():
+                # Add to startup (wrap path in quotes to handle spaces)
+                winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, f'"{exe_path}"')
+                logger.info("Added to Windows startup.")
+            else:
+                # Remove from startup
+                try:
+                    winreg.DeleteValue(key, app_name)
+                    logger.info("Removed from Windows startup.")
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+        except Exception as e:
+            messagebox.showerror("Registry Error", f"Failed to modify startup settings: {e}")
+            # Revert checkbox state on failure
+            self.startup_var.set(not self.startup_var.get())
+
+
+    def resource_path(self, relative_path):
+        """Get absolute path to resource, works for dev and for PyInstaller"""
+        try:
+            base_path = sys._MEIPASS
+        except AttributeError:
+            base_path = os.path.abspath(".")
+        return os.path.join(base_path, relative_path)
 
     def toggle_service(self):
-        """Toggles the background service on and off."""
         if self.is_running:
             self.stop_service()
         else:
             self.start_service()
 
     def start_service(self):
-        """Copies the webui file and spawns the background thread."""
         webui_dir = self.webui_var.get()
-        target_file = os.path.join(webui_dir, "index.js")
-        local_file = "index.js"
+        os.makedirs(webui_dir, exist_ok=True)
 
-        if os.path.exists(local_file):
-            try:
-                os.makedirs(webui_dir, exist_ok=True)
-                shutil.copyfile(local_file, target_file)
-                logger.info(f"Copied {local_file} to {target_file}")
-            except PermissionError:
-                messagebox.showerror(
-                    "Permission Error",
-                    f"Cannot write to {webui_dir}.\nPlease run as Administrator.",
+        # 1. Flip the registry flag just like setup.ts
+        if not enable_webui_in_registry(True):
+            messagebox.showwarning(
+                "Registry Warning",
+                "Could not set 'Allow Local Files' registry key. The game might not load the WebUI.",
+            )
+
+        # 2. Copy the webhook HTML and JS payload files
+        files_to_copy = ["index.html", "index.js"]
+        for file_name in files_to_copy:
+            local_file = self.resource_path(file_name)
+            target_file = os.path.join(webui_dir, file_name)
+
+            if os.path.exists(local_file):
+                try:
+                    shutil.copyfile(local_file, target_file)
+                    logger.info(f"Copied {local_file} to {target_file}")
+                except PermissionError:
+                    messagebox.showerror(
+                        "Permission Error",
+                        f"Cannot write to {webui_dir}.\nPlease run as Administrator.",
+                    )
+                    return
+            else:
+                logger.warning(
+                    f"Local '{local_file}' not found. Ensure both index.html and index.js exist."
                 )
-                return
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to copy index.js: {e}")
-                return
-        else:
-            logger.warning("Local 'index.js' not found. Skipping file copy.")
 
-        # Update UI state
         self.is_running = True
         self.toggle_btn.config(text="Stop Service", bg="#f44336")
 
-        # Start the background thread
         self.service_thread = threading.Thread(
             target=self.run_asyncio_loop, daemon=True
         )
         self.service_thread.start()
 
     def stop_service(self):
-        """Signals the background asyncio loop to shut down."""
         if self.loop and self.loop.is_running() and self.shutdown_event:
-            # Safely trigger the event inside the running asyncio loop
             self.loop.call_soon_threadsafe(self.shutdown_event.set)
 
-        # Update UI state
         self.is_running = False
         self.toggle_btn.config(text="Start Service", bg="#4CAF50")
 
     def run_asyncio_loop(self):
-        """Worker function containing the isolated asyncio event loop."""
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
 
@@ -296,18 +414,16 @@ class AppUI(tk.Tk):
         hotkey = self.hotkey_var.get()
         self.shutdown_event = asyncio.Event()
 
-        # Instantiate the Relay Server from game_client_server.py
+        # Spin up the Relay Server inside this process
         relay_server = GameClientServer(host="127.0.0.1", port=8888)
 
         async def run_all():
-            # Start the relay server tasks
             server_task = self.loop.create_task(relay_server.start_server())
             queue_task = self.loop.create_task(relay_server.process_message_queue())
 
-            # Start the app client task and wait for shutdown
+            # Start UI websocket hook and wait for the stop button
             await start_async_service(hotkey, delimiter, self.shutdown_event)
 
-            # Teardown the relay server when the UI signals a stop
             server_task.cancel()
             queue_task.cancel()
 
@@ -316,45 +432,6 @@ class AppUI(tk.Tk):
         finally:
             self.loop.close()
             logger.info("Asyncio loop closed.")
-
-    def resource_path(self, relative_path):
-        """ Get absolute path to resource, works for dev and for PyInstaller """
-        try:
-            # PyInstaller creates a temp folder and stores path in _MEIPASS
-            base_path = sys._MEIPASS
-        except AttributeError:
-            base_path = os.path.abspath(".")
-        return os.path.join(base_path, relative_path)
-
-    def start_service(self):
-        """Copies the webui file and spawns the background thread."""
-        webui_dir = self.webui_var.get()
-        target_file = os.path.join(webui_dir, "index.js")
-
-        # Use resource_path to find index.js whether running as .py or .exe
-        local_file = self.resource_path("index.js")
-
-        if os.path.exists(local_file):
-            try:
-                os.makedirs(webui_dir, exist_ok=True)
-                shutil.copyfile(local_file, target_file)
-                logger.info(f"Copied {local_file} to {target_file}")
-            except PermissionError:
-                messagebox.showerror("Permission Error", f"Cannot write to {webui_dir}.\nPlease run as Administrator.")
-                return
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to copy index.js: {e}")
-                return
-        else:
-            logger.warning(f"Local '{local_file}' not found. Skipping file copy.")
-
-        # Update UI state
-        self.is_running = True
-        self.toggle_btn.config(text="Stop Service", bg="#f44336")
-
-        # Start the background thread
-        self.service_thread = threading.Thread(target=self.run_asyncio_loop, daemon=True)
-        self.service_thread.start()
 
 
 if __name__ == "__main__":

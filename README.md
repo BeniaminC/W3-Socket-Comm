@@ -15,3 +15,5 @@ Easy Steps:
 6. Join a lobby
 7. Press hotkey
 8. Get battlenet tag names from lobby
+9. ???
+10. Profit

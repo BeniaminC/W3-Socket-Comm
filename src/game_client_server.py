@@ -103,6 +103,8 @@ class GameClientServer:
             if websocket in self.connected_app_clients:
                 self.connected_app_clients.remove(websocket)
                 print(f"App client disconnected: {websocket.remote_address}")
+
+
     async def establish_connection_to_game(self, address: str, timeout: float | None = None):
         try:
             while True:
@@ -135,6 +137,7 @@ class GameClientServer:
             print(f"Connection task for {address} cancelled.")
             raise  # re-raise so task truly ends
 
+
     async def _rec_payloads(self, ws):
         """Receives messages from the client and puts them into the receive queue."""
         async for message in ws:
@@ -151,6 +154,7 @@ class GameClientServer:
                 logger.debug(f"Received from game: {message}")
             else:
                 logger.info(f"Received from game: {message}")
+
 
     async def _send_payloads(self, ws):
         """Sends messages from the send queue to the client."""
@@ -169,14 +173,17 @@ class GameClientServer:
                 print(f"Failed to send to game: {e}")
                 await self.send_message_queue.put(payload)
 
+
     async def _send_payload_to_game(self, payload):
         """Queue a payload to be sent to the client WebSocket."""
         print("queueing payload to send to game")
         await self.send_message_queue.put(payload)
 
+
     async def _get_payload_from_game(self) -> str:
         message = await self.rec_message_queue.get()
         return message
+
 
     async def send_to_app_clients(self, message: str):
         """Forwards the message to all connected WebSocket addresses."""
@@ -199,12 +206,14 @@ class GameClientServer:
                 except KeyError:
                     pass  # Client was already removed
 
+
     async def process_message_queue(self):
         """Processes messages from rec_message_queue and forwards them to the forward server."""
         while True:
             message = await self.rec_message_queue.get()
             # print(f"Forwarding message: {message}")
             await self.send_to_app_clients(message)
+
 
     async def start_server(self):
         """Starts the WebSocket server."""

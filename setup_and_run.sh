@@ -51,5 +51,5 @@ pip install \
 # 4. Run the Python files
 echo "[4/4] Building exe..."
 cd src
-pyinstaller --noconfirm --onedir --windowed --add-data "index.js;." copy_battlenet_tags_script.py
+pyinstaller --noconfirm --onedir --windowed --add-data "index.js;." --add-data "index.html;." copy_battlenet_tags_script.py
 
